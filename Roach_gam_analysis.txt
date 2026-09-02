@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GAM Analysis — Roach (Rutilus rutilus) — Final Version
+======================================================
+Five-task modelling scheme (adapted from Abramis brama template):
+
+  Task 1. Multi-factor with k control (individual smooth-term p-values)
+  Task 2. Single-factor marginal effects (+ LRT vs intercept)
+  Task 3. Lifespan (LS) as predictor (+ LRT vs intercept)
+  Task 4. Multi-factor joint ecology, no k control (LRT vs intercept)
+  Task 5. Multi-factor joint ecology | k control (nested LRT)
+
+Responses:  log10(k), log10(L_lim), L_max, A_i, LS
+Predictors: GDD, log10(Area), AvgDepth, log10(k)
+
+NOTES for reviewers / readers:
+- Task 1 and Task 5 share the SAME full model (ecology + log_k). 
+  Task 1 reports individual term p-values; Task 5 reports the nested LRT.
+  Therefore AIC, R² and EDF of the full model are identical in both tasks.
+- EDF of single-predictor models depends only on the predictor's design matrix
+  and the optimized smoothing parameter (lambda). For a given predictor, lambda
+  is the same across responses, hence EDF is identical — this is expected
+  behaviour, not a bug.
+- Concurvity diagnostics (VIF, predictor correlations, smooth-term correlations)
+  are appended at the end of the script.
+
+Usage in Google Colab:
+  !pip install pygam openpyxl
+  Upload your Excel file, then run this script.
+"""
+
+import pandas as pd
+import numpy as np
+from pygam import LinearGAM, s
+from scipy.stats import chi2
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools.tools import add_constant
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+FILE_PATH = 'Roach_parameters.xlsx'   # <-- change to your filename
+N_SPLINES = 20                        # ample ceiling for GCV
+
+# ============================================================
+# 1. LOAD & CLEAN
+# ============================================================
+df = pd.read_excel(FILE_PATH)
+df = df[df['Lake'] != 'Lake'].copy()
+
+cols_num = ['Area', 'AvgDepth', 'Temp', 'GDD', 'L_lim', 'k', 't0',
+            'L_max', 'Lifespan', 'L_max_L_lim_ratio']
+for c in cols_num:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+
+df = df.drop_duplicates(subset='Lake', keep='first').copy()
+
+# Derived variables
+df['log_k']     = np.log10(df['k'])
+df['log_L_lim'] = np.log10(df['L_lim'])
+df['log_Area']  = np.log10(df['Area'])
+df['A_i']       = df['L_max_L_lim_ratio']
+df['LS']        = df['Lifespan']
+
+key_cols = ['GDD', 'Area', 'AvgDepth', 'L_lim', 'k', 'L_max',
+            'LS', 'A_i', 'log_k', 'log_L_lim', 'log_Area']
+df = df.dropna(subset=key_cols).copy()
+
+print(f"Final sample: n = {len(df)}")
+print(f"Responses: log_k, log_L_lim, L_max, A_i, LS")
+print(f"Predictors: GDD, log_Area, AvgDepth, log_k")
+
+# ============================================================
+# 2. HELPERS
+# ============================================================
+def get_scalar(x):
+    """Extract scalar from pygam's various return types."""
+    if x is None:
+        return np.nan
+    if isinstance(x, (int, float, np.number)):
+        return float(x)
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return float(x[0]) if len(x) > 0 else np.nan
+    if isinstance(x, dict):
+        return float(list(x.values())[0]) if x else np.nan
+    return np.nan
+
+def total_edof(gam):
+    """Sum effective degrees of freedom across all smooth terms."""
+    ed = gam.statistics_.get('edof', np.nan)
+    if isinstance(ed, (list, tuple, np.ndarray)):
+        return float(np.nansum(ed))
+    return float(get_scalar(ed))
+
+def robust_fit(gam_class, X, y, **kwargs):
+    """Fit GAM with error handling; return None on failure."""
+    try:
+        gam = gam_class(**kwargs)
+        gam.fit(X, y)
+        return gam
+    except Exception as e:
+        print(f"    [Fit failed] {e}")
+        return None
+
+def extract_term_pvals(gam):
+    """Return list of p-values, one per smooth term."""
+    pv = gam.statistics_.get('p_values', None)
+    if pv is None:
+        return [np.nan]
+    if isinstance(pv, (list, tuple, np.ndarray)):
+        return [float(v) if v is not None else np.nan for v in pv]
+    if isinstance(pv, dict):
+        return [float(v) if v is not None else np.nan for v in pv.values()]
+    return [float(pv)]
+
+def lrt_gaussian_rss(gam_full, y, X):
+    """
+    Likelihood Ratio Test for Gaussian GAM vs intercept-only using RSS.
+    Under Gaussian errors: deviance = RSS / scale, and scale cancels in LR.
+    """
+    try:
+        y_pred = gam_full.predict(X)
+        rss_full = np.sum((y - y_pred) ** 2)
+        rss_null = np.sum((y - np.mean(y)) ** 2)
+        lr = rss_null - rss_full
+        df_diff = max(total_edof(gam_full) - 1.0, 1.0)
+        if lr <= 0:
+            return 1.0, lr, df_diff
+        return 1 - chi2.cdf(lr, df_diff), lr, df_diff
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+def lrt_nested_rss(gam_red, gam_full, y, X_red, X_full):
+    """LRT for nested Gaussian GAMs using RSS."""
+    try:
+        rss_red  = np.sum((y - gam_red.predict(X_red)) ** 2)
+        rss_full = np.sum((y - gam_full.predict(X_full)) ** 2)
+        lr = rss_red - rss_full
+        df_diff = max(total_edof(gam_full) - total_edof(gam_red), 1.0)
+        if lr <= 0:
+            return 1.0, lr, df_diff
+        return 1 - chi2.cdf(lr, df_diff), lr, df_diff
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+# ============================================================
+# 3. MODEL SETUP
+# ============================================================
+responses = {
+    'log_k': 'log_k',
+    'log_L_lim': 'log_L_lim',
+    'L_max': 'L_max',
+    'A_i': 'A_i',
+    'LS': 'LS'
+}
+eco = ['GDD', 'log_Area', 'AvgDepth']
+results = []
+
+# ============================================================
+# TASK 1 — Multi-factor with k control (individual p-values)
+# ============================================================
+print("\n" + "=" * 70)
+print("TASK 1: Multi-factor GAMs with k control (individual p-values)")
+print("=" * 70)
+
+for rlab, rcol in responses.items():
+    if rlab == 'log_k':
+        preds = eco
+        terms = s(0, n_splines=N_SPLINES) + s(1, n_splines=N_SPLINES) + s(2, n_splines=N_SPLINES)
+    else:
+        preds = eco + ['log_k']
+        terms = (s(0, n_splines=N_SPLINES) + s(1, n_splines=N_SPLINES) +
+                 s(2, n_splines=N_SPLINES) + s(3, n_splines=N_SPLINES))
+
+    sub = df[[rcol] + preds].dropna()
+    if len(sub) < 15:
+        continue
+    X, y = sub[preds].values, sub[rcol].values
+    gam = robust_fit(LinearGAM, X, y, terms=terms)
+    if gam is None:
+        continue
+
+    pvals = extract_term_pvals(gam)
+    for i, pr in enumerate(preds):
+        p = pvals[i] if i < len(pvals) else np.nan
+        results.append({
+            'Task': 'T1_Multi_k_control_indiv',
+            'Response': rlab,
+            'Predictor': pr,
+            'p_value': p,
+            'LRT_p': np.nan,
+            'EDF': total_edof(gam),
+            'R_squared': get_scalar(gam.statistics_.get('pseudo_r2', np.nan)),
+            'AIC': get_scalar(gam.statistics_.get('AIC', np.nan)),
+            'n': len(sub),
+            'significant': 'TRUE' if (pvals[i] if i < len(pvals) else 1.0) < 0.05 else 'FALSE'
+        })
+    print(f"  {rlab:12s} | n={len(sub)} | R²={get_scalar(gam.statistics_.get('pseudo_r2', np.nan)):.3f} | AIC={get_scalar(gam.statistics_.get('AIC', np.nan)):.1f}")
+
+# ============================================================
+# TASK 2 — Single-factor marginal effects (+ LRT vs intercept)
+# ============================================================
+print("\n" + "=" * 70)
+print("TASK 2: Single-factor GAMs (marginal effects + LRT)")
+print("=" * 70)
+
+for rlab, rcol in responses.items():
+    for drv in eco:
+        sub = df[[rcol, drv]].dropna()
+        if len(sub) < 10:
+            continue
+        X, y = sub[[drv]].values, sub[rcol].values
+        gam = robust_fit(LinearGAM, X, y, terms=s(0, n_splines=N_SPLINES))
+        if gam is None:
+            continue
+
+        p = extract_term_pvals(gam)[0]
+        p_lrt, lr_stat, lr_df = lrt_gaussian_rss(gam, y, X)
+
+        results.append({
+            'Task': 'T2_Single_marginal',
+            'Response': rlab,
+            'Predictor': drv,
+            'p_value': p,
+            'LRT_p': p_lrt,
+            'EDF': total_edof(gam),
+            'R_squared': get_scalar(gam.statistics_.get('pseudo_r2', np.nan)),
+            'AIC': get_scalar(gam.statistics_.get('AIC', np.nan)),
+            'n': len(sub),
+            'significant': 'TRUE' if p < 0.05 else 'FALSE'
+        })
+        if p < 0.05 or p_lrt < 0.05:
+            print(f"  {rlab:12s} ~ {drv:12s} | p={p:.4f} | LRT_p={p_lrt:.4f} | R²={get_scalar(gam.statistics_.get('pseudo_r2', np.nan)):.3f}")
+
+# ============================================================
+# TASK 3 — LS as predictor (+ LRT vs intercept)
+# ============================================================
+print("\n" + "=" * 70)
+print("TASK 3: LS as predictor (+ LRT)")
+print("=" * 70)
+
+for rlab, rcol in responses.items():
+    if rlab == 'LS':
+        continue
+    sub = df[[rcol, 'LS']].dropna()
+    if len(sub) < 10:
+        continue
+    X, y = sub[['LS']].values, sub[rcol].values
+    gam = robust_fit(LinearGAM, X, y, terms=s(0, n_splines=N_SPLINES))
+    if gam is None:
+        continue
+
+    p = extract_term_pvals(gam)[0]
+    p_lrt, lr_stat, lr_df = lrt_gaussian_rss(gam, y, X)
+
+    results.append({
+        'Task': 'T3_LS_predictor',
+        'Response': rlab,
+        'Predictor': 'LS',
+        'p_value': p,
+        'LRT_p': p_lrt,
+        'EDF': total_edof(gam),
+        'R_squared': get_scalar(gam.statistics_.get('pseudo_r2', np.nan)),
+        'AIC': get_scalar(gam.statistics_.get('AIC', np.nan)),
+        'n': len(sub),
+        'significant': 'TRUE' if p < 0.05 else 'FALSE'
+    })
+    print(f"  {rlab:12s} ~ LS           | p={p:.4f} | LRT_p={p_lrt:.4f} | R²={get_scalar(gam.statistics_.get('pseudo_r2', np.nan)):.3f}")
+
+# ============================================================
+# TASK 4 — Joint ecology, no k control (LRT vs intercept)
+# ============================================================
+print("\n" + "=" * 70)
+print("TASK 4: Joint ecology, no k control (LRT vs intercept)")
+print("=" * 70)
+
+for rlab, rcol in responses.items():
+    sub = df[[rcol] + eco].dropna()
+    if len(sub) < 15:
+        continue
+    X, y = sub[eco].values, sub[rcol].values
+    gam = robust_fit(LinearGAM, X, y,
+                     terms=s(0, n_splines=N_SPLINES) + s(1, n_splines=N_SPLINES) + s(2, n_splines=N_SPLINES))
+    if gam is None:
+        continue
+
+    p_joint, lr_stat, lr_df = lrt_gaussian_rss(gam, y, X)
+
+    results.append({
+        'Task': 'T4_Joint_no_k',
+        'Response': rlab,
+        'Predictor': 'GDD+log_Area+AvgDepth',
+        'p_value': np.nan,
+        'LRT_p': p_joint,
+        'EDF': total_edof(gam),
+        'R_squared': get_scalar(gam.statistics_.get('pseudo_r2', np.nan)),
+        'AIC': get_scalar(gam.statistics_.get('AIC', np.nan)),
+        'n': len(sub),
+        'significant': 'TRUE' if p_joint < 0.05 else 'FALSE'
+    })
+    print(f"  {rlab:12s} | LRT_p={p_joint:.4f} | R²={get_scalar(gam.statistics_.get('pseudo_r2', np.nan)):.3f} | n={len(sub)}")
+
+# ============================================================
+# TASK 5 — Joint ecology | k control (nested LRT)
+# NOTE: full model here is IDENTICAL to Task 1. We report only the LRT,
+# but also record full-model metrics for reference (tagged as 'from T1').
+# ============================================================
+print("\n" + "=" * 70)
+print("TASK 5: Nested LRT — ecology | log_k (sensitivity)")
+print("=" * 70)
+
+sens_resp = {k: v for k, v in responses.items() if k != 'log_k'}
+for rlab, rcol in sens_resp.items():
+    sub = df[[rcol] + eco + ['log_k']].dropna()
+    if len(sub) < 15:
+        continue
+    y = sub[rcol].values
+
+    # Reduced: log_k only
+    Xr = sub[['log_k']].values
+    gam_red = robust_fit(LinearGAM, Xr, y, terms=s(0, n_splines=N_SPLINES))
+
+    # Full: ecology + log_k (same spec as Task 1)
+    Xf = sub[eco + ['log_k']].values
+    gam_full = robust_fit(LinearGAM, Xf, y,
+                          terms=(s(0, n_splines=N_SPLINES) + s(1, n_splines=N_SPLINES) +
+                                 s(2, n_splines=N_SPLINES) + s(3, n_splines=N_SPLINES)))
+    if gam_red is None or gam_full is None:
+        continue
+
+    p_joint, lr_stat, lr_df = lrt_nested_rss(gam_red, gam_full, y, Xr, Xf)
+
+    results.append({
+        'Task': 'T5_Joint_k_control',
+        'Response': rlab,
+        'Predictor': 'Eco|log_k',
+        'p_value': np.nan,
+        'LRT_p': p_joint,
+        'EDF': total_edof(gam_full),
+        'R_squared': get_scalar(gam_full.statistics_.get('pseudo_r2', np.nan)),
+        'AIC': get_scalar(gam_full.statistics_.get('AIC', np.nan)),
+        'n': len(sub),
+        'significant': 'TRUE' if p_joint < 0.05 else 'FALSE'
+    })
+    print(f"  {rlab:12s} | ecology|log_k LRT_p={p_joint:.4f} | R²={get_scalar(gam_full.statistics_.get('pseudo_r2', np.nan)):.3f}")
+
+# ============================================================
+# 4. SAVE RESULTS
+# ============================================================
+df_res = pd.DataFrame(results)
+df_res = df_res[['Task', 'Response', 'Predictor',
+                 'p_value', 'LRT_p', 'EDF', 'R_squared', 'AIC',
+                 'n', 'significant']]
+out_file = 'GAM_Roach_Results.xlsx'
+df_res.to_excel(out_file, index=False)
+
+print("\n" + "=" * 70)
+print(f"SAVED: {out_file}")
+print("=" * 70)
+
+print("\n--- SIGNIFICANT RESULTS (p < 0.05 or LRT_p < 0.05) ---")
+for _, row in df_res[df_res['significant'] == 'TRUE'].iterrows():
+    p_str = f"p={row['p_value']:.4f}" if not np.isnan(row['p_value']) else f"LRT_p={row['LRT_p']:.4f}"
+    print(f"  {row['Task']:22s} | {row['Response']:10s} ~ {row['Predictor']:15s} | {p_str:15s} | R²={row['R_squared']:.3f}")
+
+# ============================================================
+# 5. DIAGNOSTICS (VIF, correlations, concurvity)
+# ============================================================
+print("\n" + "=" * 70)
+print("DIAGNOSTICS: Multicollinearity & Concurvity")
+print("=" * 70)
+
+# 5a. VIF
+X_lin = df[['GDD', 'log_Area', 'AvgDepth']].dropna()
+X_lin_const = add_constant(X_lin)
+vif_data = pd.DataFrame({
+    'Predictor': X_lin.columns,
+    'VIF': [variance_inflation_factor(X_lin_const.values, i+1) for i in range(X_lin.shape[1])]
+})
+print("\nVIF (raw predictors):")
+print(vif_data)
+
+# 5b. Correlation matrix
+print("\nPearson correlation (raw predictors):")
+print(X_lin.corr().round(3))
+
+print("\nSpearman correlation (raw predictors):")
+print(X_lin.corr(method='spearman').round(3))
+
+# 5c. Concurvity proxy: correlation of partial dependence curves
+print("\nConcurvity proxy — correlation of partial dependence curves:")
+sub = df[['log_k', 'GDD', 'log_Area', 'AvgDepth']].dropna()
+X = sub[['GDD', 'log_Area', 'AvgDepth']].values
+y = sub['log_k'].values
+gam = LinearGAM(terms=s(0, n_splines=N_SPLINES) + s(1, n_splines=N_SPLINES) + s(2, n_splines=N_SPLINES))
+gam.fit(X, y)
+
+medians = np.median(X, axis=0)
+n_grid = 200
+labels = ['s(GDD)', 's(log_Area)', 's(AvgDepth)']
+partial_curves = []
+for i in range(3):
+    X_grid = np.tile(medians, (n_grid, 1))
+    X_grid[:, i] = np.linspace(X[:, i].min(), X[:, i].max(), n_grid)
+    partial_curves.append(gam.predict(X_grid))
+
+partial_curves = np.column_stack(partial_curves)
+corr_pd = np.corrcoef(partial_curves.T)
+print(pd.DataFrame(corr_pd, index=labels, columns=labels).round(3))
+
+print("\n" + "=" * 70)
+print("Done. Check GAM_Roach_Results.xlsx for full output.")
+print("=" * 70)
