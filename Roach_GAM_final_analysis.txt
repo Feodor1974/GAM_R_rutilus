@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Roach_GAM_final_analysis.py
+=====================================================================
+Final analysis for: "Multiple Dimensions of Life-History Variation
+in Common Roach (Rutilus rutilus) Across Lentic Water Bodies"
+
+Design (single inferential test for the whole paper):
+  Each association is modelled as a GAM (penalized regression splines,
+  smoothing parameter chosen by GCV). Significance is assessed by a
+  permutation test on the model pseudo-R2: the response is shuffled
+  across populations and the ENTIRE fitting pipeline (including GCV
+  smoothing selection) is rerun, so the null distribution includes the
+  same flexibility and overfitting risk as the observed model.
+      p_perm = (1 + #(R2_null >= R2_obs)) / (N_perm + 1)
+  Benjamini-Hochberg correction is applied within each task.
+
+Tasks (numbered 1-4 throughout the paper, code and Table 1):
+  1. Environmental drivers, univariate: 5 life-history traits x
+     (GDD, lake Area, mean Depth)
+  2. Lifespan as driver: 4 traits ~ LS
+  3. Joint environmental block (GDD + Area + AvgDepth)
+  4. Environmental block BEYOND k: Freedman-Lane permutation of the
+     residuals of the k-only model (does environment add anything
+     once k is accounted for?)
+
+Descriptive columns reported alongside: R2, adjusted R2, model EDF,
+delta-AIC vs the intercept-only null, and the 95th percentile of the
+permutation null R2 (a 'leverage/overfit alarm': observed R2 should
+clearly exceed it).
+
+Why permutation instead of asymptotic p-values:
+  Predictors span up to six orders of magnitude (Area 0.02-16400 km2),
+  so high-leverage points can inflate smooth-term p-values, and p-values
+  after GCV smoothing selection are approximate at best. The permutation
+  test is scale-invariant in effect and needs no asymptotic assumptions.
+
+Dependencies: numpy, pandas, pygam (tested on 0.12.0), openpyxl
+Run:          python Roach_GAM_final_analysis.py
+Data:         Roach_data.xlsx (156 lentic populations) in the working dir
+Output:       Roach_GAM_Final_Results.xlsx
+              (Roach_GAM_Final_Results_Control.xlsx if CONTROL = True)
+
+CONTROL switch: True restricts the analysis to populations with
+k > 0.0011 (sensitivity run excluding boundary VBGF fits where the
+asymptote is unidentifiable). The main analysis retains all 156
+populations, because near-linear trajectories (very small k, very
+large asymptotic size) are genuine biology, not noise.
+=====================================================================
+"""
+
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+from pygam import LinearGAM, s
+
+warnings.filterwarnings('ignore')
+
+# ------------------------- configuration -------------------------
+CONTROL = False          # True -> only populations with k > 0.0011
+N_PERM = 500             # permutation replicates
+SEED = 42
+LAM_GRID_1D = np.logspace(-3, 6, 13)     # lambda grid, univariate models
+LAM_GRID_MD = np.logspace(-3, 6, 7)      # lambda grid, multivariate models
+rng = np.random.default_rng(SEED)
+
+# ------------------------- load & clean --------------------------
+candidates = ['Roach_data.xlsx'] + sorted(glob.glob('Roach*.xlsx'))
+FILE_PATH = next((c for c in candidates if glob.glob(c)), None)
+assert FILE_PATH is not None, 'No data file found: put Roach_data.xlsx here.'
+
+df_raw = pd.read_excel(FILE_PATH, sheet_name=0)
+df_raw.columns = df_raw.columns.str.strip()
+df_raw = df_raw.rename(columns={'Lifespan': 'LS', 'L_max_L_lim_ratio': 'A_i'})
+
+num_cols = ['Area', 'AvgDepth', 'Temp', 'GDD', 'L_lim', 'k', 't0', 'L_max', 'LS', 'A_i']
+for col in num_cols:
+    if col in df_raw.columns:
+        df_raw[col] = pd.to_numeric(
+            df_raw[col].astype(str).str.strip()
+                .replace('\xa0', ' ', regex=False)
+                .replace(',', '.', regex=False)
+                .replace('\u2013', '-', regex=False),
+            errors='coerce')
+
+df_raw = df_raw[df_raw['Lake'] != 'Lake'].copy()
+if df_raw['Lake'].astype(str).str.strip().duplicated().any():
+    print('WARNING: duplicate lake names present - check the data file.')
+
+required_cols = ['GDD', 'Area', 'AvgDepth', 'L_lim', 'L_max', 'k', 'LS']
+df_clean = df_raw.dropna(subset=required_cols).copy()
+df_clean['A_i'] = df_clean['L_max'] / df_clean['L_lim']   # recompute, never trust the column
+df_clean['k_at_bound'] = df_clean['k'] <= 0.0011          # boundary VBGF fits
+
+df = df_clean[~df_clean['k_at_bound']].copy() if CONTROL else df_clean.copy()
+n_total = len(df)
+
+print(f'Data file: {FILE_PATH}')
+print(f'Populations analysed: {n_total}')
+print(f"k at lower bound: {int(df_clean['k_at_bound'].sum())} "
+      f"({df_clean['k_at_bound'].mean()*100:.0f}%) -> "
+      f"{'EXCLUDED (control run)' if CONTROL else 'retained (main run)'}")
+
+# ------------------------- GAM helpers ---------------------------
+def r2_of(gam):
+    r2 = gam.statistics_['pseudo_r2']
+    return float(list(r2.values())[0] if isinstance(r2, dict) else r2)
+
+def adj_r2(r2, n, edof):
+    return 1 - (1 - r2) * (n - 1) / max(n - edof, 1)
+
+def build_terms(lam_vec):
+    terms = None
+    for j, lv in enumerate(lam_vec):
+        t = s(j, lam=lv)
+        terms = t if terms is None else terms + t
+    return terms
+
+def fit_gam(X, y):
+    """Fit LinearGAM with genuine GCV smoothing selection.
+
+    Univariate: pygam gridsearch over the lambda grid.
+    Multivariate: one pass of greedy per-term coordinate descent
+    (pygam's gridsearch applies one shared lambda to all terms, which
+    over-smooths when terms need different flexibility). The same
+    pipeline is used for observed and permuted data, so the permutation
+    null inherits identical model flexibility."""
+    y = np.asarray(y, dtype=float)
+    if X.shape[1] == 1:
+        return LinearGAM(s(0)).gridsearch(X, y, lam=LAM_GRID_1D, progress=False)
+    p = X.shape[1]
+    lam_cur = np.full(p, 1.0)
+    best_gcv = np.inf
+    for i in range(p):
+        for lv in LAM_GRID_MD:
+            trial = lam_cur.copy()
+            trial[i] = lv
+            g = LinearGAM(build_terms(trial)).fit(X, y)
+            if g.statistics_['GCV'] < best_gcv - 1e-9:
+                best_gcv, lam_cur[i] = g.statistics_['GCV'], lv
+    return LinearGAM(build_terms(lam_cur)).fit(X, y)
+
+def perm_test(X, y, n_perm=N_PERM):
+    """Permutation test on pseudo-R2 of the full GAM fit.
+
+    Shuffles the response and reruns the fitting pipeline, so the null
+    reflects the same model flexibility and the same leverage structure
+    of the predictors (only the response is shuffled; X stays fixed).
+    Univariate models: full GCV selection is rerun in every replicate.
+    Multivariate models: lambda is selected once on the observed data
+    and held fixed in the replicates (computational feasibility; the
+    null still reflects the chosen flexibility and leverage).
+    Returns (gam_obs, p_perm, null_R2_p95)."""
+    y = np.asarray(y, dtype=float)
+    gam_obs = fit_gam(X, y)
+    r2_obs = r2_of(gam_obs)
+    null = np.empty(n_perm)
+    if X.shape[1] == 1:
+        for b in range(n_perm):
+            try:
+                null[b] = r2_of(fit_gam(X, rng.permutation(y)))
+            except Exception:
+                null[b] = np.nan
+    else:
+        lam_obs = [t.lam for t in gam_obs.terms if not t.isintercept]
+        terms_obs = build_terms(lam_obs)
+        for b in range(n_perm):
+            try:
+                null[b] = r2_of(LinearGAM(terms_obs).fit(X, rng.permutation(y)))
+            except Exception:
+                null[b] = np.nan
+    null = null[~np.isnan(null)]
+    p_perm = (1.0 + np.sum(null >= r2_obs)) / (len(null) + 1.0)
+    return gam_obs, float(p_perm), float(np.percentile(null, 95))
+
+def perm_test_beyond(X_full, X_red, y, n_perm=N_PERM):
+    """Freedman-Lane permutation test: does the full model explain
+    MORE than the reduced (covariate-only) model?
+
+    The reduced model is fitted once; its residuals are shuffled and
+    added back to its fitted values, and the full model is refitted
+    (lambda fixed at the observed values). The statistic is pseudo-R2
+    of the full model. Used for Task 4: environment BEYOND k."""
+    y = np.asarray(y, dtype=float)
+    gam_full = fit_gam(X_full, y)
+    r2_obs = r2_of(gam_full)
+    lam_obs = [t.lam for t in gam_full.terms if not t.isintercept]
+    terms_obs = build_terms(lam_obs)
+    gam_red = fit_gam(X_red, y)
+    fitted_red = gam_red.predict(X_red)
+    resid = y - fitted_red
+    null = np.empty(n_perm)
+    for b in range(n_perm):
+        y_star = fitted_red + rng.permutation(resid)
+        try:
+            null[b] = r2_of(LinearGAM(terms_obs).fit(X_full, y_star))
+        except Exception:
+            null[b] = np.nan
+    null = null[~np.isnan(null)]
+    p_perm = (1.0 + np.sum(null >= r2_obs)) / (len(null) + 1.0)
+    return gam_full, float(p_perm), float(np.percentile(null, 95))
+
+def bh_adjust(pvals):
+    """Benjamini-Hochberg within a family."""
+    p = np.asarray(pvals, dtype=float)
+    order = np.argsort(p)
+    ranked = p[order]
+    m = len(ranked)
+    q = ranked * m / (np.arange(m) + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out = np.empty(m)
+    out[order] = np.clip(q, 0, 1)
+    return out
+
+def aic_null(y):
+    g0 = LinearGAM().fit(np.ones((len(y), 1)), np.asarray(y, dtype=float))
+    return g0.statistics_['AIC']
+
+# ------------------------- analysis ------------------------------
+responses = ['k', 'A_i', 'L_lim', 'L_max', 'LS']
+drivers = ['GDD', 'Area', 'AvgDepth']
+rows = []
+
+def add(block, response, predictor, X, X_red=None):
+    y = df[response].values
+    if X_red is None:
+        gam, p_perm, r2_p95 = perm_test(X, y)
+    else:
+        gam, p_perm, r2_p95 = perm_test_beyond(X, X_red, y)
+    r2 = r2_of(gam)
+    edf = gam.statistics_['edof']
+    d_aic = aic_null(y) - gam.statistics_['AIC']
+    rows.append({
+        'Task': block, 'Response': response, 'Predictor': predictor,
+        'n': len(y), 'R2': r2, 'adj_R2': adj_r2(r2, len(y), edf),
+        'EDF_model': edf, 'delta_AIC_vs_null': d_aic,
+        'p_perm': p_perm, 'R2_null_p95': r2_p95})
+    print(f'  {block:28s} {response:6s} ~ {predictor:26s} '
+          f'R2 = {r2:.3f}, p_perm = {p_perm:.4f}')
+
+print('\nTask 1: traits ~ single environmental driver')
+for driver in drivers:
+    for response in responses:
+        add('Task1_single_driver', response, driver, df[[driver]].values)
+
+print('\nTask 2: traits ~ lifespan')
+for response in ['A_i', 'L_lim', 'k', 'L_max']:
+    add('Task2_LS', response, 'LS', df[['LS']].values)
+
+print('\nTask 3: joint environmental block')
+for response in responses:
+    add('Task3_env_joint', response, 'GDD + Area + AvgDepth', df[drivers].values)
+
+print('\nTask 4: environmental block BEYOND k (Freedman-Lane)')
+for response in ['A_i', 'L_lim', 'L_max', 'LS']:
+    add('Task4_env_beyond_k', response, 'GDD + Area + AvgDepth | k',
+        df[drivers + ['k']].values, df[['k']].values)
+
+# ------------------------- finalize ------------------------------
+res = pd.DataFrame(rows)
+res['p_BH_within_block'] = np.nan
+for block in res['Task'].unique():
+    m = res['Task'] == block
+    res.loc[m, 'p_BH_within_block'] = bh_adjust(res.loc[m, 'p_perm'].values)
+res['significant_BH_0.05'] = (res['p_BH_within_block'] < 0.05).map({True: 'TRUE', False: 'FALSE'})
+
+num_round = ['R2', 'adj_R2', 'EDF_model', 'delta_AIC_vs_null', 'R2_null_p95']
+res[num_round] = res[num_round].round(4)
+res[['p_perm', 'p_BH_within_block']] = res[['p_perm', 'p_BH_within_block']].round(4)
+
+suffix = '_Control' if CONTROL else ''
+out = f'Roach_GAM_Final_Results{suffix}.xlsx'
+
+# compatibility sheet: same numbers in the manuscript Table 1 layout
+compat = res[['Task', 'Response', 'Predictor', 'p_perm', 'p_BH_within_block',
+                 'R2', 'adj_R2', 'EDF_model', 'delta_AIC_vs_null', 'R2_null_p95',
+                 'n', 'significant_BH_0.05']].rename(
+    columns={'p_perm': 'p_value_perm', 'EDF_model': 'EDF', 'R2': 'R_squared',
+             'delta_AIC_vs_null': 'delta_AIC', 'significant_BH_0.05': 'significant'})
+
+with pd.ExcelWriter(out) as writer:
+    compat.to_excel(writer, sheet_name='Tasks1-4_compat', index=False)
+    res.to_excel(writer, sheet_name='Results', index=False)
+    df_clean[['Lake', 'Country', 'GDD', 'Area', 'AvgDepth',
+              'k', 'L_lim', 'L_max', 'LS', 'A_i', 'k_at_bound',
+              'Reference']].to_excel(writer, sheet_name='Dataset', index=False)
+
+sig = res[res['significant_BH_0.05'] == 'TRUE']
+print('\n' + '=' * 60)
+print(f'Done. Saved: {out}')
+print(f'Significant after BH (per block): {len(sig)}')
+for _, rr in sig.iterrows():
+    print(f"  {rr['Block']}: {rr['Response']} ~ {rr['Predictor']} "
+          f"(p_BH = {rr['p_BH_within_block']}, R2 = {rr['R2']})")
